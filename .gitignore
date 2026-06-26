@@ -1,0 +1,53 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training outputs and logs
+output/
+outputs/
+output_dir/
+Output_dir/
+finetune_results/
+finetune_dual_output/
+runs/
+logs/
+*.log
+events.out.tfevents*
+
+# Model checkpoints and generated artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+checkpoint*/
+checkpoints/
+saved_models/
+
+# Local datasets and large imagery
+data/
+Data/
+datasets/
+*.tif
+*.tiff
+*.img
+*.hdf
+*.h5
+*.npy
+*.npz
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
