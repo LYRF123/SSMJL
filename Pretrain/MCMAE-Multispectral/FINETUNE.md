@@ -83,9 +83,3 @@ python main_linprobe.py \
 ## CPU Debugging
 
 For a quick CPU smoke test, use a very small dataset and pass `--device cpu`, `--epochs 1`, and a small `--batch_size`. GPU is recommended for real training.
-
-## Slurm / Submitit
-
-`submitit_pretrain.py`、`submitit_finetune.py` 和 `submitit_linprobe.py` 用于 Slurm 集群。没有集群环境时，请直接运行上面的 `main_*.py`。
-
-这些脚本不再内置特定集群的共享目录、队列名或 GPU 约束。需要提交到 Slurm 时，请按自己的环境显式传入 `--job_dir`、`--partition` 和 `--constraint`；如果不传 `--job_dir`，日志目录会默认放在 `<output_dir>/submitit/%j`。
