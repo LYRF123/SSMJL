@@ -1,6 +1,6 @@
 # MCMAE-Multispectral
 
-本目录包含 ConvMAE/ConvViT 在多光谱 TIF 图像上的预训练、分类微调和线性探测代码。目标检测相关示例已经从仓库移除。
+本目录包含 ConvMAE/ConvViT 在多光谱 TIF 图像上的预训练、分类微调和线性探测代码。
 
 ## Environment
 

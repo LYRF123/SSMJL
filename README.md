@@ -8,8 +8,6 @@ The repository currently focuses on three workflows:
 - ConvMAE multispectral masked autoencoder pretraining, fine-tuning, and linear probing
 - Single-encoder and dual-encoder downstream classification fine-tuning
 
-Object detection examples have been removed. The repository does not include raw datasets, model checkpoints, or personal path configuration.
-
 ## Project Layout
 
 ```text
@@ -143,10 +141,3 @@ These checks cover checkpoint transfer, multi-band augmentation, paired TIFF dat
 ## Outputs
 
 Training outputs are written to the directory passed through the command line, such as `./output_dir/...`.
-
-Do not commit:
-
-- Raw TIF/TIFF remote-sensing images
-- `.pth`, `.pt`, `.ckpt`, or other model checkpoint files
-- `output_dir/`, `finetune_results/`, TensorBoard logs, or experiment artifacts
-- Personal absolute paths, account information, or local-only configuration files
