@@ -59,7 +59,7 @@ def convvit_base_patch16(in_chans=3, **kwargs):
 
 def convvit_tiny_patch16(in_chans=3, **kwargs):
     model = ConvViT(
-        img_size=[224, 56, 28], patch_size=[4, 2, 2], embed_dim=[96, 192, 384], depth=[2, 2, 11], num_heads=6, mlp_ratio=[4, 4, 4], qkv_bias=True,
+        img_size=[224, 56, 28], patch_size=[4, 2, 2], embed_dim=[64, 96, 192], depth=[2, 2, 8], num_heads=3, mlp_ratio=[4, 4, 4], qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), in_chans=in_chans, **kwargs)
     return model
 

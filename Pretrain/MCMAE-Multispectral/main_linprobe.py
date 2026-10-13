@@ -20,6 +20,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ssmjl_utils import class_mapping, prepare_legacy_timm, validate_bands
+
+prepare_legacy_timm()
+
 import timm
 
 assert timm.__version__ == "0.3.2" # version check
@@ -193,7 +199,7 @@ def main(args):
     )
 
     if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
+        checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
@@ -290,7 +296,8 @@ def main(args):
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
+            if 'acc5' in test_stats:
+                log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},

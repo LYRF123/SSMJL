@@ -39,10 +39,11 @@ for _path in (_current_dir, _repo_root):
 
 from feature_extractor import ConvMAEFeatureExtractor
 from models_vit import VisionTransformer
+from ssmjl_utils import class_mapping, load_checkpoint, load_required_weights, validate_bands
 
 
 def parse_bands(value):
-    return [int(item.strip()) for item in value.split(',') if item.strip()]
+    return validate_bands(int(item.strip()) for item in value.split(',') if item.strip())
 
 
 def get_args_parser():
@@ -132,12 +133,21 @@ class DualEncoderClassifier(nn.Module):
         super().__init__()
         self.convmae = convmae_model   # frozen
         self.supcon = supcon_model     # frozen
+        for encoder in (self.convmae, self.supcon):
+            encoder.requires_grad_(False)
+            encoder.eval()
 
         self.classifier = nn.Sequential(
             nn.Linear(200, 128), nn.ReLU(), nn.Dropout(dropout_rate),
             nn.Linear(128, 64),  nn.ReLU(), nn.Dropout(dropout_rate),
             nn.Linear(64, num_classes),
         )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.convmae.eval()
+        self.supcon.eval()
+        return self
 
     def forward(self, ht_img_cm, ck_img_cm, ht_img_sc, ck_img_sc):
         with torch.no_grad():
@@ -160,38 +170,36 @@ class DualEncoderClassifier(nn.Module):
 # 3. Dataset (matched HT + CK TIF pairs)
 # ================================================================
 class DualSourceDataset(Dataset):
-    def __init__(self, ht_dir, ck_dir, band_indices, img_size=224):
-        self.band_indices = band_indices
+    def __init__(self, ht_dir, ck_dir, band_indices, img_size=224, class_to_idx=None):
+        self.band_indices = validate_bands(band_indices)
         self.img_size = img_size
-
-        # collect labels from HT
-        ht_files = {}
-        unique_labels = set()
-        for label_dir in sorted(os.listdir(ht_dir)):
-            lp = os.path.join(ht_dir, label_dir)
-            if not os.path.isdir(lp): continue
-            unique_labels.add(label_dir)
-            for fn in sorted(os.listdir(lp)):
-                if fn.lower().endswith(('.tif', '.tiff')):
-                    ht_files[os.path.splitext(fn)[0]] = (os.path.join(lp, fn), label_dir)
-
-        self.label_to_idx = {l: i for i, l in enumerate(sorted(unique_labels))}
+        self.label_to_idx = class_mapping(ht_dir, class_to_idx)
+        class_mapping(ck_dir, self.label_to_idx)
         self.num_classes = len(self.label_to_idx)
-
-        # collect CK files
-        ck_files = {}
-        for label_dir in sorted(os.listdir(ck_dir)):
-            lp = os.path.join(ck_dir, label_dir)
-            if not os.path.isdir(lp): continue
-            for fn in sorted(os.listdir(lp)):
-                if fn.lower().endswith(('.tif', '.tiff')):
-                    ck_files[os.path.splitext(fn)[0]] = os.path.join(lp, fn)
-
-        self.pairs = []
-        for fkey in sorted(set(ht_files) & set(ck_files)):
-            ht_path, lbl = ht_files[fkey]
-            self.pairs.append((ht_path, ck_files[fkey], self.label_to_idx[lbl], fkey + '.tif'))
-
+        def collect(root):
+            files = {}
+            for label in self.label_to_idx:
+                folder = os.path.join(root, label)
+                if not os.path.isdir(folder):
+                    continue
+                for name in sorted(os.listdir(folder)):
+                    if not name.lower().endswith(('.tif', '.tiff')):
+                        continue
+                    key = (label, os.path.splitext(name)[0])
+                    if key in files:
+                        raise ValueError(f"Duplicate sample stem in {folder}: {key[1]}")
+                    files[key] = os.path.join(folder, name)
+            return files
+        ht_files, ck_files = collect(ht_dir), collect(ck_dir)
+        if set(ht_files) != set(ck_files):
+            raise ValueError(
+                f"Unmatched HT/CK pairs: missing CK={sorted(set(ht_files) - set(ck_files))}; "
+                f"missing HT={sorted(set(ck_files) - set(ht_files))}"
+            )
+        self.pairs = [(ht_files[key], ck_files[key], self.label_to_idx[key[0]],
+                       f'{key[0]}/{key[1]}') for key in sorted(ht_files)]
+        if not self.pairs:
+            raise ValueError(f"No paired .tif/.tiff images found under {ht_dir} and {ck_dir}")
         print(f"Dataset: {len(self.pairs)} pairs, {self.num_classes} classes → {self.label_to_idx}")
 
     def __len__(self):
@@ -250,8 +258,13 @@ def load_convmae(ckpt, device, in_chans=5):
 def load_supcon(ckpt, device, in_chans=5, output_dim=100):
     print(f"Loading SupCon: {ckpt}")
     model = SupConModel(in_chans=in_chans, hidden_dim=256, output_dim=output_dim)
-    sd = torch.load(ckpt, map_location=device)
-    model.load_state_dict(sd, strict=False)
+    sd = load_checkpoint(ckpt)
+    # SupCon pretraining saves feature_extractor.vit.* and projection_head.net.*.
+    sd = {key.replace('feature_extractor.', 'encoder.', 1)
+          .replace('projection_head.net.', 'projection.', 1): value
+          for key, value in sd.items()}
+    load_required_weights(model, sd)
+    model.to(device)
     for p in model.parameters(): p.requires_grad = False
     model.eval()
     return model
@@ -268,7 +281,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(model.classifier.parameters(),
                                            lr=config['lr'], weight_decay=config['wd'])
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config['epochs'])
-        self.best_acc = 0.0
+        self.best_acc = -float('inf')
         self.train_hist = {'loss': [], 'acc': []}
         self.val_hist   = {'loss': [], 'acc': []}
 
@@ -317,7 +330,11 @@ class Trainer:
                 print(f"  ✓ saved (acc={vl_acc:.2f}%)")
 
         print(f"\nDone! Best val acc: {self.best_acc:.2f}%")
-        self._report(vl_p, vl_l)
+        best = torch.load(os.path.join(self.config['output_dir'], 'best_model.pth'),
+                          map_location=self.device, weights_only=False)
+        self.model.load_state_dict(best['model_state_dict'])
+        _, _, best_preds, best_labels = self._epoch(self.val_loader, False)
+        self._report(best_preds, best_labels)
 
     def _save(self, name):
         d = self.config['output_dir']; os.makedirs(d, exist_ok=True)
@@ -326,13 +343,14 @@ class Trainer:
 
     def _report(self, preds, labels):
         d = self.config['output_dir']; os.makedirs(d, exist_ok=True)
-        names = [str(i) for i in range(self.config['num_classes'])]
+        names = list(self.train_loader.dataset.label_to_idx)
+        indices = list(range(self.config['num_classes']))
 
-        report = classification_report(labels, preds, target_names=names)
+        report = classification_report(labels, preds, labels=indices, target_names=names, zero_division=0)
         print("\n" + report)
         with open(os.path.join(d, 'classification_report.txt'), 'w') as f: f.write(report)
 
-        cm = confusion_matrix(labels, preds)
+        cm = confusion_matrix(labels, preds, labels=indices)
         plt.figure(figsize=(6, 5))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
         plt.title('Confusion Matrix'); plt.tight_layout()
@@ -352,6 +370,8 @@ class Trainer:
 def main():
     args = get_args_parser().parse_args()
     config = config_from_args(args)
+    if config['img_size'] != 224 or config['epochs'] < 1:
+        raise ValueError("Dual encoder training requires --img-size 224 and --epochs >= 1")
 
     torch.manual_seed(config['seed']); np.random.seed(config['seed']); random.seed(config['seed'])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -364,8 +384,10 @@ def main():
 
     print("Loading dataset...")
     tr_ds = DualSourceDataset(config['train_ht'], config['train_ck'], config['band_indices'], config['img_size'])
-    vl_ds = DualSourceDataset(config['val_ht'],   config['val_ck'],   config['band_indices'], config['img_size'])
+    vl_ds = DualSourceDataset(config['val_ht'], config['val_ck'], config['band_indices'],
+                              config['img_size'], class_to_idx=tr_ds.label_to_idx)
     config['num_classes'] = tr_ds.num_classes
+    config['class_to_idx'] = tr_ds.label_to_idx
 
     tr_ld = DataLoader(tr_ds, batch_size=config['batch_size'], shuffle=True,
                        num_workers=config['num_workers'], pin_memory=True)

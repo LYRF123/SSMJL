@@ -18,13 +18,17 @@ import sys
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
+sys.path.insert(0, os.path.dirname(_current_dir))
+from ssmjl_utils import class_mapping, load_checkpoint, load_required_weights, prepare_legacy_timm, validate_bands
+
+prepare_legacy_timm()
 
 # 导入原始的VisionTransformer模型
 from models_vit import VisionTransformer
 
 
 def parse_bands(value):
-    return [int(item.strip()) for item in value.split(',') if item.strip()]
+    return validate_bands(int(item.strip()) for item in value.split(',') if item.strip())
 
 
 def get_args_parser():
@@ -114,45 +118,17 @@ class ViTClassifier(nn.Module):
         )
         
         # 如果提供了预训练的特征提取器权重，加载它们
-        if pretrained_backbone_path and os.path.exists(pretrained_backbone_path):
+        if pretrained_backbone_path:
             self.load_pretrained_backbone(pretrained_backbone_path)
     
     def load_pretrained_backbone(self, pretrained_path):
         """从对比学习模型中加载特征提取器权重"""
-        try:
-            print(f"正在加载预训练特征提取器权重: {pretrained_path}")
-            
-            # 加载预训练权重
-            checkpoint = torch.load(pretrained_path, map_location='cpu')
-            
-            # 获取当前模型的state_dict
-            current_state_dict = self.state_dict()
-            
-            # 创建新的state_dict，只包含特征提取器的权重
-            updated_state_dict = {}
-            
-            print("正在匹配权重...")
-            for name, param in checkpoint.items():
-                # 只加载特征提取器相关的权重，跳过投影头/分类头
-                if name.startswith('feature_extractor.'):
-                    if name in current_state_dict:
-                        updated_state_dict[name] = param
-                        print(f"成功匹配: {name}")
-            
-            # 加载权重（只加载特征提取器部分）
-            missing_keys, unexpected_keys = self.load_state_dict(updated_state_dict, strict=False)
-            
-            print(f"成功加载 {len(updated_state_dict)} 个特征提取器权重")
-            print(f"分类头使用随机初始化 ({len([k for k in missing_keys if 'classifier' in k])} 个参数)")
-            
-            if len(updated_state_dict) == 0:
-                print("警告: 没有找到匹配的特征提取器权重")
-                print("检查模型文件格式...")
-                print("模型权重的键:", list(checkpoint.keys())[:10])
-                
-        except Exception as e:
-            print(f"加载预训练权重时出错: {e}")
-            print("将使用随机初始化的权重")
+        print(f"正在加载预训练特征提取器权重: {pretrained_path}")
+        checkpoint = load_checkpoint(pretrained_path)
+        weights = {key.removeprefix('feature_extractor.'): value
+                   for key, value in checkpoint.items() if key.startswith('feature_extractor.')}
+        count = load_required_weights(self.feature_extractor, weights)
+        print(f"成功加载 {count} 个特征提取器权重，分类头使用随机初始化")
     
     def freeze_feature_extractor(self):
         """冻结特征提取器的参数"""
@@ -184,29 +160,32 @@ class ViTClassifier(nn.Module):
 
 class ImageDataset(Dataset):
     """多波段遥感图像数据集"""
-    def __init__(self, data_dir, band_indices, target_size=(224, 224), transform=None):
+    def __init__(self, data_dir, band_indices, target_size=(224, 224), transform=None, class_to_idx=None):
         self.data_dir = data_dir
-        self.band_indices = band_indices
+        self.band_indices = validate_bands(band_indices)
         self.target_size = target_size
         self.transform = transform
         
         # 获取所有类别文件夹
-        self.class_folders = sorted([d for d in os.listdir(data_dir) 
-                                   if os.path.isdir(os.path.join(data_dir, d))])
-        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.class_folders)}
+        self.class_to_idx = class_mapping(data_dir, class_to_idx)
+        self.class_folders = list(self.class_to_idx)
         
         # 收集所有图像路径和标签
         self.samples = []
         for class_name in self.class_folders:
             class_dir = os.path.join(data_dir, class_name)
+            if not os.path.isdir(class_dir):
+                continue
             class_idx = self.class_to_idx[class_name]
             
             # 获取该类别下的所有.tif文件
-            for img_file in os.listdir(class_dir):
-                if img_file.lower().endswith('.tif'):
+            for img_file in sorted(os.listdir(class_dir)):
+                if img_file.lower().endswith(('.tif', '.tiff')):
                     img_path = os.path.join(class_dir, img_file)
                     self.samples.append((img_path, class_idx))
         
+        if not self.samples:
+            raise ValueError(f"No .tif/.tiff images found under {data_dir}")
         print(f"数据集加载完成: {len(self.samples)} 个样本")
         print(f"类别: {self.class_folders}")
         
@@ -251,9 +230,7 @@ class ImageDataset(Dataset):
             return img, label
             
         except Exception as e:
-            print(f"加载图像失败 {img_path}: {e}")
-            # 返回一个默认的张量和标签
-            return torch.zeros(len(self.band_indices), *self.target_size), label
+            raise RuntimeError(f"Failed to read training image {img_path}: {e}") from e
 
 
 class Trainer:
@@ -283,7 +260,7 @@ class Trainer:
         # 记录训练历史
         self.train_history = {'loss': [], 'acc': []}
         self.val_history = {'loss': [], 'acc': []}
-        self.best_val_acc = 0.0
+        self.best_val_acc = -float('inf')
     
     def train_epoch(self):
         """训练一个epoch"""
@@ -449,8 +426,10 @@ class Trainer:
     def generate_final_report(self, val_preds, val_labels):
         """生成最终验证报告"""
         # 分类报告
-        class_names = [str(i) for i in range(self.config['num_classes'])]
-        report = classification_report(val_labels, val_preds, target_names=class_names)
+        class_names = list(self.train_loader.dataset.class_to_idx)
+        indices = list(range(self.config['num_classes']))
+        report = classification_report(val_labels, val_preds, labels=indices,
+                                       target_names=class_names, zero_division=0)
         print("\n分类报告:")
         print(report)
         
@@ -460,7 +439,7 @@ class Trainer:
             f.write(report)
         
         # 混淆矩阵
-        cm = confusion_matrix(val_labels, val_preds)
+        cm = confusion_matrix(val_labels, val_preds, labels=indices)
         plt.figure(figsize=(8, 6))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                    xticklabels=class_names, yticklabels=class_names)
@@ -508,6 +487,8 @@ def main():
     print("="*60)
     args = get_args_parser().parse_args()
     config = config_from_args(args)
+    if config['target_size'] != (224, 224) or config['num_epochs'] < 1:
+        raise ValueError("ViT training requires --target-size 224 and --num-epochs >= 1")
     
     # 设置随机种子
     torch.manual_seed(config['seed'])
@@ -537,8 +518,12 @@ def main():
     val_dataset = ImageDataset(
         config['val_data_dir'], 
         config['band_indices'], 
-        config['target_size']
+        config['target_size'],
+        class_to_idx=train_dataset.class_to_idx
     )
+    if config['num_classes'] != len(train_dataset.class_to_idx):
+        raise ValueError("--num-classes must match the number of training class directories")
+    config['class_to_idx'] = train_dataset.class_to_idx
     
     # 创建数据加载器
     train_loader = DataLoader(

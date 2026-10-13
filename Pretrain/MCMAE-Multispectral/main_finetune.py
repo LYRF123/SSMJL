@@ -20,6 +20,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import rasterio
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ssmjl_utils import class_mapping, prepare_legacy_timm, validate_bands
+
+prepare_legacy_timm()
+
 import timm
 
 assert timm.__version__ == "0.3.2" # version check
@@ -110,7 +116,7 @@ class MultibandDataset(SatelliteDataset):
     mean = [0.5] * 5  # Default to 0.5 for all channels
     std = [0.5] * 5   # Default to 0.5 for all channels
     
-    def __init__(self, root_dir, transform=None, selected_bands=None, in_chans=5):
+    def __init__(self, root_dir, transform=None, selected_bands=None, in_chans=5, class_to_idx=None):
         """
         :param root_dir: Directory with subdirectories containing TIFF images
         :param transform: pytorch Transform for transforms and tensor conversion
@@ -123,22 +129,23 @@ class MultibandDataset(SatelliteDataset):
 
         self.root_dir = root_dir
         self.transform = transform
-        self.selected_bands = selected_bands if selected_bands is not None else list(range(in_chans))
+        self.selected_bands = validate_bands(range(in_chans) if selected_bands is None else selected_bands, in_chans)
         
         # Update mean and std for the actual number of channels
-        self.mean = self.mean[:in_chans]
-        self.std = self.std[:in_chans]
+        self.mean = [0.5] * in_chans
+        self.std = [0.5] * in_chans
         
         # Get all image paths and labels
         self.img_paths = []
         self.labels = []
         self.class_names = []
         
-        for class_idx, class_name in enumerate(sorted(os.listdir(root_dir))):
+        self.class_to_idx = class_mapping(root_dir, class_to_idx)
+        for class_name, class_idx in self.class_to_idx.items():
             class_path = os.path.join(root_dir, class_name)
             if os.path.isdir(class_path):
                 self.class_names.append(class_name)
-                for img_name in os.listdir(class_path):
+                for img_name in sorted(os.listdir(class_path)):
                     if img_name.lower().endswith(('.tif', '.tiff')):
                         self.img_paths.append(os.path.join(class_path, img_name))
                         self.labels.append(class_idx)
@@ -355,7 +362,8 @@ def main(args):
     dataset_val = MultibandDataset(
         root_dir=os.path.join(args.data_path, 'val'),
         selected_bands=selected_bands,
-        in_chans=args.in_chans
+        in_chans=args.in_chans,
+        class_to_idx=dataset_train.class_to_idx
     )
     
     transform_val = SatelliteDataset.build_transform(
@@ -439,7 +447,7 @@ def main(args):
     )
 
     if args.finetune and not args.eval:
-        checkpoint = torch.load(args.finetune, map_location='cpu')
+        checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
@@ -581,7 +589,8 @@ def main(args):
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
+            if 'acc5' in test_stats:
+                log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},

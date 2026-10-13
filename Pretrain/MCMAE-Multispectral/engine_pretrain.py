@@ -50,10 +50,13 @@ def train_one_epoch(model: torch.nn.Module,
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
-        loss /= accum_iter
+        group_start = (data_iter_step // accum_iter) * accum_iter
+        group_size = min(accum_iter, len(data_loader) - group_start)
+        update_grad = (data_iter_step + 1) % accum_iter == 0 or data_iter_step + 1 == len(data_loader)
+        loss /= group_size
         loss_scaler(loss, optimizer, parameters=model.parameters(),
-                    update_grad=(data_iter_step + 1) % accum_iter == 0)
-        if (data_iter_step + 1) % accum_iter == 0:
+                    update_grad=update_grad)
+        if update_grad:
             optimizer.zero_grad()
 
         if device.type == 'cuda':

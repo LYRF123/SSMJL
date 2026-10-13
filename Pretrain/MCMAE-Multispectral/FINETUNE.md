@@ -50,6 +50,7 @@ python main_pretrain.py \
 
 ```bash
 python main_finetune.py \
+  --model convvit_tiny_patch16 \
   --data_path "<dataset_root>" \
   --finetune "<pretrained_checkpoint.pth>" \
   --output_dir "./output_dir/mcmae_finetune" \
@@ -63,6 +64,8 @@ python main_finetune.py \
 ```
 
 The evaluation code automatically skips Acc@5 when the number of classes is smaller than 5.
+
+The fine-tuning model must match the pretraining architecture. The example uses the repository's default ConvMAE Tiny checkpoint (`[64, 96, 192]` stage widths). For a ConvMAE Base checkpoint, pass `--model convvit_base_patch16` instead.
 
 ## Linear Probe
 

@@ -16,6 +16,13 @@ from collections import Counter
 import kornia.augmentation as K
 import kornia   
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ssmjl_utils import class_mapping, prepare_legacy_timm, validate_bands
+
+prepare_legacy_timm()
+
 import timm
 import torchvision.models as models
 from models_vit import VisionTransformer  # 保留自定义的 VisionTransformer 模型导入
@@ -100,8 +107,9 @@ class AugmentationPipeline(nn.Module):
         super().__init__()
         self.random_resized_crop = K.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0))
         self.random_horizontal_flip = K.RandomHorizontalFlip(p=0.5)
-        # 修改 ColorJitter：将 saturation 和 hue 设为 0，避免调用 rgb_to_hsv
-        self.color_jitter = K.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.0, hue=0.0)
+        # ColorJitter still calls RGB-to-HSV even when hue=0 in older Kornia.
+        # Apply common brightness/contrast factors directly to all bands.
+        self.jitter_strength = 0.4
         # 为当前波段数量获取归一化参数
         self.normalize_mean, self.normalize_std = get_normalization_params(num_bands)
     
@@ -110,7 +118,13 @@ class AugmentationPipeline(nn.Module):
         x = x.unsqueeze(0)  # (1, C, H, W)
         x = self.random_resized_crop(x)
         x = self.random_horizontal_flip(x)
-        x = self.color_jitter(x)
+        brightness = torch.empty((), device=x.device).uniform_(
+            1 - self.jitter_strength, 1 + self.jitter_strength)
+        contrast = torch.empty((), device=x.device).uniform_(
+            1 - self.jitter_strength, 1 + self.jitter_strength)
+        x = (x * brightness).clamp(0, 1)
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        x = ((x - mean) * contrast + mean).clamp(0, 1)
         x = x.squeeze(0)
         # 手动归一化
         mean = self.normalize_mean.to(x.device).view(-1, 1, 1)
@@ -141,23 +155,21 @@ class RasterioMultiChannelImageFolder(Dataset):
         """
         self.root = root
         self.transform = transform
-        self.band_indices = band_indices  # 0-based索引
+        self.band_indices = validate_bands(band_indices)  # 0-based索引
         self.samples = []
-        self.class_to_idx = {}
+        self.class_to_idx = class_mapping(root)
         self.class_counts = {}  # 存储每个类别的样本数量
 
         if not os.path.isdir(root):
             raise ValueError(f"数据集目录不存在: {root}")
         
         # 遍历类别文件夹
-        for class_name in sorted(os.listdir(root)):
+        for class_name, idx in self.class_to_idx.items():
             class_dir = os.path.join(root, class_name)
             if not os.path.isdir(class_dir):
                 continue
                 
             # 为类别分配索引
-            idx = int(class_name) if class_name.isdigit() else len(self.class_to_idx)
-            self.class_to_idx[class_name] = idx
             
             # 初始化类别计数
             self.class_counts[idx] = 0
@@ -847,7 +859,7 @@ if __name__ == '__main__':
         raise ValueError("--train_val_split 必须在 0 和 1 之间")
     
     # 解析波段选择参数
-    band_indices = [int(b) for b in args.bands.split(',')]
+    band_indices = validate_bands(int(b) for b in args.bands.split(','))
     num_bands = len(band_indices)
     
     # 检查波段索引是否有效

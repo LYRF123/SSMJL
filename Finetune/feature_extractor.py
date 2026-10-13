@@ -8,6 +8,10 @@ import sys
 
 # 添加项目路径以便导入模型
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ssmjl_utils import load_checkpoint, load_required_weights, prepare_legacy_timm, validate_bands
+
+prepare_legacy_timm()
 
 import models_convmae
 from util.pos_embed import get_2d_sincos_pos_embed
@@ -33,7 +37,7 @@ class ConvMAEFeatureExtractor(nn.Module):
                  checkpoint_path=None,
                  in_chans=5,
                  input_size=224,
-                 selected_bands=[0, 1, 2, 3, 4],
+                 selected_bands=None,
                  mean=None,
                  std=None,
                  device='cuda'):
@@ -52,7 +56,11 @@ class ConvMAEFeatureExtractor(nn.Module):
         
         self.in_chans = in_chans
         self.input_size = input_size
-        self.selected_bands = selected_bands
+        self.selected_bands = validate_bands(
+            range(in_chans) if selected_bands is None else selected_bands, in_chans
+        )
+        if input_size != 224:
+            raise ValueError("The supplied ConvMAE architecture requires input_size=224")
         self.device = device
         
         # 默认标准化参数（与训练时一致）
@@ -67,7 +75,7 @@ class ConvMAEFeatureExtractor(nn.Module):
         )
         
         # 加载预训练权重
-        if checkpoint_path and os.path.exists(checkpoint_path):
+        if checkpoint_path:
             self._load_pretrained_weights(checkpoint_path)
         else:
             print("⚠️ 未提供checkpoint路径或文件不存在，使用随机初始化权重")
@@ -89,29 +97,14 @@ class ConvMAEFeatureExtractor(nn.Module):
         """加载预训练权重"""
         print(f"📥 加载预训练权重: {checkpoint_path}")
         
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        # 处理不同的checkpoint格式
-        if 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-        
-        # 加载权重（忽略decoder部分）
-        model_dict = self.convmae.state_dict()
-        pretrained_dict = {}
-        
-        for k, v in state_dict.items():
-            # 只保留encoder相关的权重
-            if k in model_dict and not k.startswith('decoder'):
-                pretrained_dict[k] = v
-                
-        model_dict.update(pretrained_dict)
-        self.convmae.load_state_dict(model_dict, strict=False)
-        
-        print(f"✅ 成功加载 {len(pretrained_dict)} 个参数")
+        state_dict = load_checkpoint(checkpoint_path)
+        # The downstream 100-D projection is the first decoder layer and must
+        # also be restored, although the remainder of the decoder is unused.
+        prefixes = ('patch_embed', 'blocks', 'norm.', 'decoder_embed.0.')
+        required = [key for key in self.convmae.state_dict()
+                    if key == 'pos_embed' or key.startswith(prefixes)]
+        count = load_required_weights(self.convmae, state_dict, required)
+        print(f"✅ 成功加载 {count} 个编码器及投影层参数")
     
     def _setup_feature_extractor(self):
         """设置特征提取器"""

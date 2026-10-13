@@ -32,6 +32,8 @@ pip install -r requirements.txt
 
 The MCMAE code is based on an older ConvMAE stack and requires `timm==0.3.2`. This version is pinned in `requirements.txt`. If your current environment already uses a newer `timm`, using a fresh virtual environment is recommended.
 
+The training entry points include compatibility aliases for the legacy `torch._six` imports used by timm 0.3.2. CPU regression checks were run with Python 3.9, PyTorch 1.13.1, torchvision 0.14.1, NumPy 1.26.4, and Kornia 0.6.12.
+
 ## Data Layout
 
 For SupCon pretraining, `--data_path` should point directly to class folders:
@@ -108,6 +110,8 @@ val_ht/0/sample_101.tif
 val_ck/0/sample_101.tif
 ```
 
+Pairs are matched by class folder and file stem. Unmatched or duplicate pairs stop training with an error. Validation uses the training class-to-index mapping, including when a validation split omits a class. Pretrained encoder and projection weights must be complete and have matching shapes; incompatible checkpoints are rejected. The dual-encoder report evaluates the saved best model.
+
 ```bash
 python Finetune/train_dual_classifier.py \
   --train-ht "<train_high_temperature_dir>" \
@@ -124,6 +128,17 @@ python Finetune/train_dual_classifier.py \
 MCMAE fine-tuning and linear-probing commands are documented in [Pretrain/MCMAE-Multispectral/FINETUNE.md](Pretrain/MCMAE-Multispectral/FINETUNE.md).
 
 Note: `Pretrain/MCMAE-Multispectral/main_linprobe.py` still follows the upstream RGB/ImageFolder linear-probing workflow. Use `main_finetune.py` for multispectral TIF fine-tuning, or extend `main_linprobe.py` before using it directly on multispectral TIF data.
+
+ConvMAE Tiny pretraining uses stage widths `[64, 96, 192]`, depths `[2, 2, 8]`, and three attention heads. Use `--model convvit_tiny_patch16` in MCMAE fine-tuning to load these checkpoints. Older standalone ConvViT Tiny checkpoints with widths `[96, 192, 384]` require their original architecture.
+
+## Regression Checks
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests
+```
+
+These checks cover checkpoint transfer, multi-band augmentation, paired TIFF data, validation labels, encoder freezing, contrastive loss, and gradient accumulation. Synthetic CPU training runs verify the main pretraining and classifier workflows; they do not reproduce the paper's reported accuracy.
 
 ## Outputs
 

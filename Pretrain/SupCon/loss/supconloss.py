@@ -31,15 +31,15 @@ class SupConLoss(nn.Module):
         Returns:
             A loss scalar.
         """
-        device = (torch.device('cuda')
-                  if features.is_cuda
-                  else torch.device('cpu'))
+        device = features.device
 
         if len(features.shape) < 3:
             raise ValueError('`features` needs to be [bsz, n_views, ...],'
                              'at least 3 dimensions are required')
         if len(features.shape) > 3:
             features = features.view(features.shape[0], features.shape[1], -1)
+        # The repository's projection head returns unnormalized embeddings.
+        features = nn.functional.normalize(features, dim=-1)
 
         batch_size = features.shape[0]
         if labels is not None and mask is not None:
@@ -86,7 +86,8 @@ class SupConLoss(nn.Module):
 
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        denominator = exp_logits.sum(1, keepdim=True).clamp_min(torch.finfo(logits.dtype).tiny)
+        log_prob = logits - torch.log(denominator)
 
         # compute mean of log-likelihood over positive
         # modified to handle edge cases when there is no positive pair
