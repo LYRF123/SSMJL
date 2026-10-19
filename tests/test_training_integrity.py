@@ -173,11 +173,91 @@ def test_frozen_encoders_remain_in_eval_during_classifier_training():
     image = torch.rand(2, 4)
     logits = model(image, image, image, image)
     logits.sum().backward()
-    assert model.classifier.training
+    assert model.mlp_cm.training and model.mlp_sc.training and model.classifier.training
     assert not convmae.training and not supcon.training
     assert all(parameter.grad is None for encoder in (convmae, supcon) for parameter in encoder.parameters())
-    assert all(parameter.grad is not None for parameter in model.classifier.parameters())
+    assert all(parameter.grad is not None for head in (model.mlp_cm, model.mlp_sc, model.classifier)
+               for parameter in head.parameters())
     torch.testing.assert_close(logits, model(image, image, image, image))
+
+
+def test_dual_fusion_normalizes_each_independent_branch():
+    torch.manual_seed(0)
+    convmae = nn.Module()
+    convmae.forward_encoder = lambda image: image
+    convmae.projection = nn.Linear(4, 100)
+    supcon = nn.Linear(4, 100)
+    model = DualEncoderClassifier(convmae, supcon, dropout_rate=0).eval()
+    cm_parameters = {id(parameter) for parameter in model.mlp_cm.parameters()}
+    sc_parameters = {id(parameter) for parameter in model.mlp_sc.parameters()}
+    assert cm_parameters.isdisjoint(sc_parameters)
+    images = [torch.rand(3, 4) for _ in range(4)]
+    with torch.no_grad():
+        expected = model(*images)
+        for head in (model.mlp_cm, model.mlp_sc):
+            head[-1].weight.mul_(100)
+            head[-1].bias.mul_(100)
+            torch.testing.assert_close(model(*images), expected)
+            head[-1].weight.div_(100)
+            head[-1].bias.div_(100)
+
+
+def test_adadelta_updates_both_branch_mlps_and_classifier(tmp_path):
+    torch.manual_seed(0)
+    convmae = nn.Module()
+    convmae.forward_encoder = lambda image: image
+    convmae.projection = nn.Linear(4, 100)
+    supcon = nn.Linear(4, 100)
+    model = DualEncoderClassifier(convmae, supcon, dropout_rate=0)
+    images = [torch.rand(4, 4) for _ in range(4)]
+    dataset = torch.utils.data.TensorDataset(
+        *images, torch.tensor([0, 1, 2, 0]), torch.arange(4))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=4)
+    trainer = Trainer(model, loader, loader, torch.device('cpu'),
+                      {'lr': 1.0, 'wd': 1e-4, 'epochs': 2, 'output_dir': str(tmp_path)})
+    assert isinstance(trainer.optimizer, torch.optim.Adadelta)
+    optimized = {id(parameter) for group in trainer.optimizer.param_groups for parameter in group['params']}
+    assert optimized == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    loss, _, _, _ = trainer._epoch(loader, True)
+    assert np.isfinite(loss)
+    for prefix in ('mlp_cm.', 'mlp_sc.', 'classifier.'):
+        assert any(not torch.equal(parameter, before[name]) for name, parameter in model.named_parameters()
+                   if name.startswith(prefix))
+    for name, parameter in model.named_parameters():
+        if name.startswith(('convmae.', 'supcon.')):
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+            assert parameter.grad is None
+
+
+@pytest.mark.parametrize('channels', [3, 5, 7])
+def test_training_augmentation_preserves_paired_views_and_validation_is_deterministic(tmp_path, channels):
+    grid = np.linspace(0.1, 0.8, 224 * 224, dtype=np.float32).reshape(224, 224)
+    raw = np.stack([grid * (0.5 + 0.05 * band) for band in range(channels)])
+    for treatment in ('ht', 'ck'):
+        path = tmp_path / treatment / '0' / 'sample.tif'
+        path.parent.mkdir(parents=True)
+        with rasterio.open(path, 'w', driver='GTiff', width=224, height=224,
+                           count=channels, dtype='float32') as image:
+            image.write(raw)
+    train = DualSourceDataset(tmp_path / 'ht', tmp_path / 'ck', range(channels), is_train=True)
+    validation = DualSourceDataset(tmp_path / 'ht', tmp_path / 'ck', range(channels))
+    torch.manual_seed(41)
+    first = train[0]
+    torch.manual_seed(41)
+    repeated = train[0]
+    torch.manual_seed(42)
+    different = train[0]
+    for index in range(4):
+        assert first[index].shape == (channels, 224, 224)
+        assert torch.isfinite(first[index]).all()
+        torch.testing.assert_close(first[0], first[index], rtol=0, atol=0)
+        torch.testing.assert_close(first[index], repeated[index], rtol=0, atol=0)
+    assert not torch.equal(first[0], different[0])
+    val_first, val_second = validation[0], validation[0]
+    for index in range(4):
+        torch.testing.assert_close(val_first[index], val_second[index], rtol=0, atol=0)
+    assert first[4:] == val_first[4:] == (0, '0/sample')
 
 
 def test_contrastive_loss_is_scale_invariant_and_handles_no_positive_pair():

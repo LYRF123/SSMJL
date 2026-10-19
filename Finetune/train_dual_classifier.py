@@ -6,12 +6,12 @@
 流程（与 finetune_classifier_head.py 一致，只是编码器变两个）：
 
     高温TIF → ConvMAE编码器(冻结) → 100维 ─┐
-    对照TIF → ConvMAE编码器(冻结) → 100维 ─┤ → 200维 ─┐
+    对照TIF → ConvMAE编码器(冻结) → 100维 ─┤ → 200维 → MLP → L2 ─┐
                                              │          │
     高温TIF → SupCon编码器(冻结) → 100维 ─┐  │          ├→ (f1+f2)/2 → 分类头 → 预测
-    对照TIF → SupCon编码器(冻结) → 100维 ─┤ → 200维 ─┘
+    对照TIF → SupCon编码器(冻结) → 100维 ─┤ → 200维 → MLP → L2 ─┘
                                              │
-    两个编码器都冻结，只训练分类头。
+    两个编码器都冻结，训练分支 MLP 和分类头。
 """
 
 import os
@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from functools import partial
 import rasterio
 import random
@@ -60,7 +61,7 @@ def get_args_parser():
     parser.add_argument('--img-size', type=int, default=224, help='输入图像边长')
     parser.add_argument('--batch-size', type=int, default=32, help='批大小')
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--lr', type=float, default=1e-3, help='分类头学习率')
+    parser.add_argument('--lr', type=float, default=1.0, help='分支 MLP 和分类头学习率')
     parser.add_argument('--wd', type=float, default=1e-4, help='权重衰减')
     parser.add_argument('--output-dir', default='./finetune_dual_output', help='输出目录')
     parser.add_argument('--num-workers', type=int, default=4, help='DataLoader worker 数')
@@ -128,7 +129,7 @@ class SupConModel(nn.Module):
 # 2. 双编码器分类模型
 # ================================================================
 class DualEncoderClassifier(nn.Module):
-    """ConvMAE + SupCon → average fusion → MLP classifier"""
+    """ConvMAE + SupCon → branch MLPs → L2 → average fusion → classifier"""
     def __init__(self, convmae_model, supcon_model, num_classes=3, dropout_rate=0.2):
         super().__init__()
         self.convmae = convmae_model   # frozen
@@ -137,6 +138,14 @@ class DualEncoderClassifier(nn.Module):
             encoder.requires_grad_(False)
             encoder.eval()
 
+        self.mlp_cm = nn.Sequential(
+            nn.Linear(200, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(256, 200),
+        )
+        self.mlp_sc = nn.Sequential(
+            nn.Linear(200, 256), nn.ReLU(), nn.Dropout(dropout_rate),
+            nn.Linear(256, 200),
+        )
         self.classifier = nn.Sequential(
             nn.Linear(200, 128), nn.ReLU(), nn.Dropout(dropout_rate),
             nn.Linear(128, 64),  nn.ReLU(), nn.Dropout(dropout_rate),
@@ -161,18 +170,43 @@ class DualEncoderClassifier(nn.Module):
             c = self.supcon(ck_img_sc)  # (B,100)
             feat_sc = torch.cat([h, c], dim=1)  # (B,200)
 
-        # simple average fusion
-        fused = (feat_cm + feat_sc) / 2.0
+        z_cm = F.normalize(self.mlp_cm(feat_cm), p=2, dim=1)
+        z_sc = F.normalize(self.mlp_sc(feat_sc), p=2, dim=1)
+        fused = (z_cm + z_sc) / 2.0
         return self.classifier(fused)
 
 
 # ================================================================
 # 3. Dataset (matched HT + CK TIF pairs)
 # ================================================================
+class PairedMultibandAugmentation:
+    def __init__(self, img_size=224):
+        self.spatial = transforms.Compose([
+            transforms.RandomResizedCrop(
+                img_size, scale=(0.8, 1.0),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+        ])
+
+    def __call__(self, *images):
+        batch = self.spatial(torch.stack(images))
+        batch = (batch + 1.0) / 2.0
+        brightness = torch.empty((), device=batch.device).uniform_(0.8, 1.2)
+        contrast = torch.empty((), device=batch.device).uniform_(0.8, 1.2)
+        batch = batch * brightness
+        mean = batch.mean(dim=(-2, -1), keepdim=True)
+        batch = (batch - mean) * contrast + mean
+        return tuple((batch - 0.5) / 0.5)
+
+
 class DualSourceDataset(Dataset):
-    def __init__(self, ht_dir, ck_dir, band_indices, img_size=224, class_to_idx=None):
+    def __init__(self, ht_dir, ck_dir, band_indices, img_size=224, class_to_idx=None,
+                 is_train=False):
         self.band_indices = validate_bands(band_indices)
         self.img_size = img_size
+        self.augmentation = PairedMultibandAugmentation(img_size) if is_train else None
         self.label_to_idx = class_mapping(ht_dir, class_to_idx)
         class_mapping(ck_dir, self.label_to_idx)
         self.num_classes = len(self.label_to_idx)
@@ -235,9 +269,11 @@ class DualSourceDataset(Dataset):
     def __getitem__(self, idx):
         ht_path, ck_path, label, fname = self.pairs[idx]
         ht_raw, ck_raw = self._read(ht_path), self._read(ck_path)
-        return (self._prep_convmae(ht_raw), self._prep_convmae(ck_raw),
-                self._prep_supcon(ht_raw), self._prep_supcon(ck_raw),
-                label, fname)
+        images = (self._prep_convmae(ht_raw), self._prep_convmae(ck_raw),
+                  self._prep_supcon(ht_raw), self._prep_supcon(ck_raw))
+        if self.augmentation is not None:
+            images = self.augmentation(*images)
+        return (*images, label, fname)
 
 
 # ================================================================
@@ -278,8 +314,10 @@ class Trainer:
         self.model = model; self.train_loader = train_loader
         self.val_loader = val_loader; self.device = device; self.config = config
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.AdamW(model.classifier.parameters(),
-                                           lr=config['lr'], weight_decay=config['wd'])
+        self.optimizer = torch.optim.Adadelta(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=config['lr'], weight_decay=config['wd'],
+        )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config['epochs'])
         self.best_acc = -float('inf')
         self.train_hist = {'loss': [], 'acc': []}
@@ -383,7 +421,8 @@ def main():
         raise ValueError(f"请在 config 中设置路径: {', '.join(missing_paths)}")
 
     print("Loading dataset...")
-    tr_ds = DualSourceDataset(config['train_ht'], config['train_ck'], config['band_indices'], config['img_size'])
+    tr_ds = DualSourceDataset(config['train_ht'], config['train_ck'], config['band_indices'],
+                             config['img_size'], is_train=True)
     vl_ds = DualSourceDataset(config['val_ht'], config['val_ck'], config['band_indices'],
                               config['img_size'], class_to_idx=tr_ds.label_to_idx)
     config['num_classes'] = tr_ds.num_classes
@@ -402,7 +441,7 @@ def main():
 
     n_total = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_total:,} total | {n_train:,} trainable (classifier head only)")
+    print(f"Params: {n_total:,} total | {n_train:,} trainable (branch MLPs and classifier)")
 
     Trainer(model, tr_ld, vl_ld, device, config).train()
 
